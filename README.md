@@ -1,4 +1,4 @@
-# Exercise 2.2 — Data acquisition and processing from Project Gutenberg
+# Data acquisition and processing from Project Gutenberg
 
 ## Overview
 This project crawls the “Top 100 — Last 30 Days” list from Project Gutenberg, downloads the **top-20** TXT ebooks, cleans out Gutenberg headers/footers, tokenizes and lemmatizes the text, and builds a unified vocabulary across all books. The repository includes code and generated statistics for full reproducibility.
