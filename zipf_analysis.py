@@ -1,222 +1,209 @@
 # zipf_analysis.py
 
 """
-Zipf analysis on the unified vocabulary built from the 20 cleaned books.
-This script:
-  - reads tokens from data/clean/*.txt (space-separated, lemmatized),
-  - computes empirical frequencies p(r) sorted by rank,
-  - overlays Zipf-law curves p(r) ~ C * r^{-a} for several exponents,
-  - fits the best exponent via log-log linear regression,
-  - writes CSV and saves plots under outputs/.
+Compute and visualize Zipf's law on the unified vocabulary built from cleaned books.
+
 """
 
-# ===== Standard imports =====
+from __future__ import annotations
+import argparse
 import os
-import math
+import sys
 from pathlib import Path
 from collections import Counter
+from typing import Tuple
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
 
-# ===== Paths =====
-PROJECT_ROOT = Path(__file__).resolve().parent
-CLEAN_DIR = PROJECT_ROOT / "data" / "clean"
-OUT_DIR = PROJECT_ROOT / "outputs"
-OUT_DIR.mkdir(parents=True, exist_ok=True)
+# -----------------------------
+# Utility functions
+# -----------------------------
 
-
-# ===== Utilities =====
-def load_clean_tokens(clean_dir: Path) -> Counter:
-    """
-    Load all cleaned text files and count tokens.
-
-    Notes (green comments):
-    - Files in data/clean were produced by your pipeline; each file contains
-      tokens separated by single spaces and already lemmatized.
-    """
+def read_clean_tokens(clean_dir: Path) -> Counter:
+    # Read all cleaned .txt files and accumulate token counts.
+    # Cleaned files were written by clean_and_vocab.py (space-separated lemmas).
+    counter = Counter()
     if not clean_dir.exists():
         raise FileNotFoundError(f"Clean directory not found: {clean_dir}")
 
-    counter = Counter()
-    total_files = 0
+    files = sorted([p for p in clean_dir.glob("*.txt") if p.is_file()])
+    if not files:
+        raise RuntimeError(f"No cleaned .txt files found in: {clean_dir}. "
+                           f"Run clean_and_vocab.py first.")
 
-    for fp in sorted(clean_dir.glob("*.txt")):
-        total_files += 1
+    for fp in files:
+        # NOTE: each file is a long space-separated string of tokens
         with fp.open("r", encoding="utf-8", errors="ignore") as f:
-            # Read whole file and split on whitespace; tokens are normalized already
-            tokens = f.read().split()
-            counter.update(tokens)
+            text = f.read()
+        # Split by whitespace and update global counter
+        tokens = text.split()
+        counter.update(tokens)
 
-    if total_files == 0:
-        raise RuntimeError(
-            f"No files in {clean_dir}. Run `python clean_and_vocab.py` first."
-        )
     return counter
 
 
-def empirical_rank_freq(counter: Counter):
-    """
-    Turn a token counter into rank–frequency arrays.
-
-    Returns:
-      words_sorted: list of tokens in descending count order
-      counts_sorted: np.array of counts in the same order
-      probs_sorted:  np.array of normalized frequencies in the same order
-    """
-    items = counter.most_common()  # already sorted by count desc
-    words_sorted = [w for w, c in items]
-    counts_sorted = np.array([c for w, c in items], dtype=np.int64)
+def build_rank_frequency(counter: Counter) -> Tuple[np.ndarray, np.ndarray, list, np.ndarray]:
+    # Convert counts to a sorted rank–frequency representation.
+    # Returns: ranks, probs, words_sorted, counts_sorted
+    items = counter.most_common()
+    words_sorted = [w for (w, c) in items]
+    counts_sorted = np.array([c for (w, c) in items], dtype=np.int64)
     total = counts_sorted.sum()
-    probs_sorted = counts_sorted / total
-    return words_sorted, counts_sorted, probs_sorted
+
+    # Avoid division by zero (should not happen if we have tokens)
+    probs = counts_sorted.astype(np.float64) / float(total)
+    ranks = np.arange(1, len(counts_sorted) + 1, dtype=np.int64)
+    return ranks, probs, words_sorted, counts_sorted
 
 
-def zipf_probs(V: int, a: float) -> np.ndarray:
-    """
-    Build a normalized Zipf probability vector of length V for exponent `a`.
-
-    Math (green comments):
-    - p(r) = C * r^{-a}, r=1..V, where C = 1 / sum_{r=1}^V r^{-a}
-    - We use the generalized harmonic number for normalization.
-    """
-    ranks = np.arange(1, V + 1, dtype=np.float64)
-    denom = np.sum(ranks ** (-a))
-    C = 1.0 / denom
-    return C * (ranks ** (-a))
-
-
-def fit_zipf_exponent(probs: np.ndarray, rmin: int = 1, rmax: int | None = None) -> tuple[float, float]:
-    """
-    Fit exponent a from empirical probabilities by linear regression on log–log:
-      log p = log C - a * log r  -> slope = -a
-
-    Args:
-      probs: empirical probability array sorted by rank
-      rmin:  starting rank to include (>=1)
-      rmax:  ending rank to include (<= len(probs)); None = full length
-
-    Returns:
-      (a_hat, C_hat)
-    """
-    V = len(probs)
-    if rmax is None:
-        rmax = V
-    r = np.arange(1, V + 1, dtype=np.float64)
-    mask = (r >= rmin) & (r <= rmax) & (probs > 0)
-    x = np.log(r[mask])
-    y = np.log(probs[mask])
-
-    # Linear fit y = b0 + b1 * x;  b1 ≈ slope = -a
-    b1, b0 = np.polyfit(x, y, 1)
-    a_hat = -float(b1)
-    C_hat = float(np.exp(b0))
-    return a_hat, C_hat
-
-
-def save_freq_table(words, counts, probs, out_csv: Path, top_k: int | None = None):
-    """
-    Save rank–frequency table to CSV for inspection.
-    """
-    V = len(words)
-    if top_k is None:
-        top_k = V
+def save_rank_table(out_csv: Path, ranks: np.ndarray, words: list, counts: np.ndarray, probs: np.ndarray) -> None:
+    # Save "rank,word,count,prob" as CSV for inspection.
     df = pd.DataFrame({
-        "rank": np.arange(1, top_k + 1),
-        "word": words[:top_k],
-        "count": counts[:top_k],
-        "prob": probs[:top_k],
+        "rank": ranks,
+        "word": words,
+        "count": counts,
+        "prob": probs
     })
     df.to_csv(out_csv, index=False)
 
 
-def plot_rank_freq(probs: np.ndarray, out_png: Path, title: str):
-    """
-    Plot empirical rank–frequency on log–log axes.
-    """
-    ranks = np.arange(1, len(probs) + 1, dtype=np.float64)
+def fit_zipf_exponent(ranks: np.ndarray, probs: np.ndarray, rmin: int, rmax: int) -> Tuple[float, float]:
+    # Fit exponent 'a' on a restricted scaling window [rmin, rmax].
+    # Model in log10 space: log p(r) = c - a * log r
+    mask = (ranks >= rmin) & (ranks <= rmax)
+    if mask.sum() < 5:
+        raise ValueError(f"Too few points to fit in window [{rmin}, {rmax}]")
 
-    plt.figure(figsize=(8, 5))
-    # Use a light line to keep file size small; scatter on huge V can be heavy.
-    plt.loglog(ranks, probs, label="Empirical", linewidth=1.25)
-    plt.xlabel("Rank (r)")
-    plt.ylabel("Frequency p(r)")
-    plt.title(title)
-    plt.grid(True, which="both", linestyle="--", alpha=0.4)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(out_png, dpi=160)
-    plt.close()
+    x = np.log10(ranks[mask])
+    y = np.log10(probs[mask])
+
+    # Least-squares line y = b + m*x; here m = -a, b = log10(C)
+    m, b = np.polyfit(x, y, 1)
+    a_fit = -m
+    C_fit = 10 ** b
+    return a_fit, C_fit
 
 
-def plot_overlay(probs: np.ndarray, exponents: list[float], a_hat: float,
-                 out_png: Path, title: str):
-    """
-    Overlay empirical curve with several Zipf-law curves (including the fitted a_hat).
-    """
-    V = len(probs)
-    ranks = np.arange(1, V + 1, dtype=np.float64)
+def model_with_fixed_a(ranks: np.ndarray, probs: np.ndarray, rmin: int, rmax: int, a: float) -> np.ndarray:
+    # For a fixed 'a', estimate C by least squares in log-space on the same scaling window.
+    mask = (ranks >= rmin) & (ranks <= rmax)
+    x = np.log10(ranks[mask])
+    y = np.log10(probs[mask])
 
-    plt.figure(figsize=(8, 5))
-    plt.loglog(ranks, probs, label="Empirical", linewidth=1.5)
-
-    # Plot user-specified exponents
-    for a in exponents:
-        plt.loglog(ranks, zipf_probs(V, a), linestyle="--", label=f"Zipf a={a:.2f}")
-
-    # Plot fitted exponent
-    plt.loglog(ranks, zipf_probs(V, a_hat), linewidth=2.0, label=f"Fitted a={a_hat:.3f}")
-
-    plt.xlabel("Rank (r)")
-    plt.ylabel("Frequency p(r)")
-    plt.title(title)
-    plt.grid(True, which="both", linestyle="--", alpha=0.4)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(out_png, dpi=160)
-    plt.close()
+    # For fixed slope -a, the best intercept b is mean(y + a*x)
+    b = np.mean(y + a * x)
+    C = 10 ** b
+    return C * (ranks.astype(np.float64) ** (-a))
 
 
-# ===== Main =====
+# -----------------------------
+# Plotting
+# -----------------------------
+
+def plot_empirical_rank_freq(out_png: Path, ranks: np.ndarray, probs: np.ndarray) -> None:
+    # Basic log–log rank–frequency plot.
+    fig, ax = plt.subplots(figsize=(9, 6))
+    ax.loglog(ranks, probs, label="Empirical")
+    ax.set_xlabel("Rank (r)")
+    ax.set_ylabel("Frequency p(r)")
+    ax.set_title("Zipf: Empirical rank–frequency (Top-20 books)")
+    ax.grid(True, which="both", ls=":", alpha=0.5)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=200)
+    plt.close(fig)
+
+
+def plot_overlay(out_png: Path,
+                 ranks: np.ndarray,
+                 probs: np.ndarray,
+                 a_candidates=(0.8, 1.0, 1.2),
+                 fit_window: Tuple[int, int] = (10, 3000)) -> float:
+    # Overlay empirical curve with several Zipf models and a fitted slope.
+    rmin, rmax = fit_window
+
+    # Fit 'a' only on the scaling regime to avoid tail bias
+    a_fit, C_fit = fit_zipf_exponent(ranks, probs, rmin, rmax)
+    p_fit = C_fit * (ranks.astype(np.float64) ** (-a_fit))
+
+    # Prepare candidate curves with log-space LS intercept
+    models = []
+    for a in a_candidates:
+        p = model_with_fixed_a(ranks, probs, rmin, rmax, a)
+        models.append((a, p))
+
+    # Plot
+    fig, ax = plt.subplots(figsize=(9, 6))
+    ax.loglog(ranks, probs, label="Empirical")
+    for a, p in models:
+        ax.loglog(ranks, p, linestyle="--", label=f"Zipf a={a:.2f}")
+    ax.loglog(ranks, p_fit, linewidth=2.0, label=f"Fitted a={a_fit:.3f}")
+
+    ax.set_xlabel("Rank (r)")
+    ax.set_ylabel("Frequency p(r)")
+    ax.set_title("Zipf: empirical vs. Zipf-law models")
+    ax.grid(True, which="both", ls=":", alpha=0.5)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=200)
+    plt.close(fig)
+
+    return a_fit
+
+
+# -----------------------------
+# Main
+# -----------------------------
+
 def main():
-    print("[INFO] Loading cleaned tokens from:", CLEAN_DIR)
-    counter = load_clean_tokens(CLEAN_DIR)
-    words, counts, probs = empirical_rank_freq(counter)
-    V = len(words)
-    total_tokens = int(counts.sum())
-    print(f"[INFO] Vocabulary size V = {V:,d}")
-    print(f"[INFO] Total tokens     N = {total_tokens:,d}")
-    print(f"[INFO] Sum of probs       = {probs.sum():.6f}")
-
-    # Save top table (you can change top_k if you want fewer rows)
-    out_csv = OUT_DIR / "zipf_freqs.csv"
-    save_freq_table(words, counts, probs, out_csv, top_k=min(5000, V))
-    print(f"[INFO] CSV written -> {out_csv}")
-
-    # Fit exponent (you can tweak the fitting window if needed)
-    a_hat, C_hat = fit_zipf_exponent(probs, rmin=1, rmax=None)
-    print(f"[INFO] Fitted exponent a_hat = {a_hat:.4f}  (C_hat = {C_hat:.6e})")
-
-    # Plot empirical curve
-    plot_rank_freq(
-        probs,
-        OUT_DIR / "zipf_rank_freq.png",
-        title="Zipf: Empirical rank–frequency (Top-20 books)"
+    parser = argparse.ArgumentParser(
+        description="Zipf's law analysis for the unified vocabulary (Top-20 Gutenberg books)."
     )
+    parser.add_argument("--clean-dir", type=str, default="data/clean",
+                        help="Directory of cleaned texts (space-separated tokens).")
+    parser.add_argument("--out-dir", type=str, default="outputs",
+                        help="Directory to write CSV and figures.")
+    parser.add_argument("--rmin", type=int, default=10,
+                        help="Lower rank bound for fitting (inclusive).")
+    parser.add_argument("--rmax", type=int, default=3000,
+                        help="Upper rank bound for fitting (inclusive).")
+    args = parser.parse_args()
 
-    # Overlay with several Zipf exponents + fitted one
-    candidate_as = [0.8, 1.0, 1.2]  # <- try more if you like
-    plot_overlay(
-        probs,
-        candidate_as,
-        a_hat,
-        OUT_DIR / "zipf_overlay.png",
-        title="Zipf: empirical vs. Zipf-law models"
-    )
-    print(f"[INFO] Plots saved -> {OUT_DIR/'zipf_rank_freq.png'} and {OUT_DIR/'zipf_overlay.png'}")
+    clean_dir = Path(args.clean_dir)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1) Read cleaned tokens & aggregate counts
+    print("[INFO] Reading cleaned tokens ...")
+    counter = read_clean_tokens(clean_dir)
+
+    # 2) Build rank-frequency & save table
+    print("[INFO] Building rank–frequency table ...")
+    ranks, probs, words, counts = build_rank_frequency(counter)
+    out_csv = out_dir / "zipf_freqs.csv"
+    save_rank_table(out_csv, ranks, words, counts, probs)
+    print(f"[INFO] Saved rank table -> {out_csv}")
+
+    # 3) Plot empirical curve
+    rank_freq_png = out_dir / "zipf_rank_freq.png"
+    plot_empirical_rank_freq(rank_freq_png, ranks, probs)
+    print(f"[INFO] Saved empirical figure -> {rank_freq_png}")
+
+    # 4) Plot overlay with models and fitted slope
+    overlay_png = out_dir / "zipf_overlay.png"
+    a_fit = plot_overlay(overlay_png, ranks, probs,
+                         a_candidates=(0.8, 1.0, 1.2),
+                         fit_window=(args.rmin, args.rmax))
+    print(f"[INFO] Saved overlay -> {overlay_png}")
+    print(f"[INFO] Fitted exponent a (window {args.rmin}-{args.rmax}): a = {a_fit:.4f}")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"[ERROR] {e}", file=sys.stderr)
+        sys.exit(1)
